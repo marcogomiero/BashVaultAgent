@@ -9,21 +9,17 @@
 # or zero if all commands exit successfully.
 set -euo pipefail
 
-# --- Configuration ---
-# VAULT_ADDR: The address of your Vault server.
-# Defaults to http://127.0.0.1:8200 if not set in the environment.
-VAULT_ADDR="${VAULT_ADDR:-http://127.0.0.1:8200}"
+# --- Default Configuration Values ---
+# These defaults will be used if not overridden by the config file or environment variables.
+DEFAULT_VAULT_ADDR="http://127.0.0.1:8200"
+DEFAULT_LOG_FILE="/var/log/bashi_va.log"
+DEFAULT_RENEWAL_THRESHOLD_PERCENT=50
 
-# VAULT_TOKEN: The Vault token to manage.
-# IMPORTANT: It is highly recommended to set this as an environment variable (e.g., export VAULT_TOKEN="s.yourtoken")
-# for security reasons rather than hardcoding it here.
-
-# LOG_FILE: Path to the script's log file.
-LOG_FILE="/var/log/bashi_va.log"
-
-# RENEWAL_THRESHOLD_PERCENT: Renew the token when its current TTL drops below this percentage
-# of its creation_ttl (maximum allowed TTL for the token).
-RENEWAL_THRESHOLD_PERCENT=50 # Renew when TTL is below 50% of creation_ttl
+# --- Script Configuration ---
+# Path to the configuration file.
+# Defaults to 'bashi_va.cfg' in the same directory as the script.
+# You can override this via an environment variable, e.g., export BASHI_CONFIG="/etc/my_vault_agent/config.cfg"
+CONFIG_FILE="${BASHI_CONFIG:-$(dirname "$(readlink -f "$0")")/bashi_va.cfg}"
 
 # --- Functions ---
 
@@ -47,11 +43,41 @@ log_message() {
     fi
 }
 
+# load_config: Reads configuration parameters from the specified config file.
+load_config() {
+    log_message "INFO" "Attempting to load configuration from ${CONFIG_FILE}..."
+    if [[ -f "${CONFIG_FILE}" ]]; then
+        # Source the config file. It's assumed to be a simple key=value bash-parsable file.
+        # This is safe if you trust the content of the config file.
+        . "${CONFIG_FILE}"
+        log_message "INFO" "Configuration loaded successfully from ${CONFIG_FILE}."
+    else
+        log_message "WARNING" "Configuration file not found at ${CONFIG_FILE}. Using default values."
+    fi
+
+    # Assign values, prioritizing environment variables, then config file, then defaults.
+    # VAULT_ADDR
+    # Check if VAULT_ADDR is unset or empty after sourcing config
+    VAULT_ADDR="${VAULT_ADDR:-${DEFAULT_VAULT_ADDR}}"
+    log_message "INFO" "Using Vault address: ${VAULT_ADDR}"
+
+    # LOG_FILE
+    LOG_FILE="${LOG_FILE:-${DEFAULT_LOG_FILE}}"
+    log_message "INFO" "Using log file path: ${LOG_FILE}"
+
+    # RENEWAL_THRESHOLD_PERCENT
+    RENEWAL_THRESHOLD_PERCENT="${RENEWAL_THRESHOLD_PERCENT:-${DEFAULT_RENEWAL_THRESHOLD_PERCENT}}"
+    log_message "INFO" "Using renewal threshold: ${RENEWAL_THRESHOLD_PERCENT}%"
+
+    # VAULT_TOKEN
+    # This must be set as an environment variable or in the config file.
+    # We will check if it's set later during pre-flight checks.
+    # Note: Setting VAULT_TOKEN directly in config file is less secure than env var for production.
+}
+
 # vault_api_call: Makes a cURL request to the Vault API.
 # Handles HTTP response codes and returns the JSON body on success, logs error on failure.
 # Usage: vault_api_call <METHOD> <ENDPOINT> [DATA]
-# Example: vault_api_call "GET" "auth/token/lookup-self"
-# Example: vault_api_call "POST" "auth/token/renew-self"
 vault_api_call() {
     local method="$1"
     local endpoint="$2"
@@ -70,18 +96,13 @@ vault_api_call() {
     local response_body
     local http_code_pattern="%{http_code}"
 
-    # Execute curl and capture both the body and the HTTP status code.
-    # Redirect stderr to /dev/null to suppress curl's own error messages from polluting stdout.
     response_body_and_code=$(curl "${curl_opts[@]}" -H "X-Vault-Token: ${VAULT_TOKEN}" "${VAULT_ADDR}/v1/${endpoint}" -w "${http_code_pattern}" 2>/dev/null)
 
-    # Extract the HTTP code (last 3 characters)
     response_code="${response_body_and_code: -3}"
-    # Extract the JSON body (everything except the last 3 characters which are the HTTP code)
     response_body="${response_body_and_code:0:${#response_body_and_code}-3}"
 
-    # Check if the HTTP response code indicates success (2xx)
     if [[ "$response_code" -ge 200 && "$response_code" -lt 300 ]]; then
-        echo "$response_body" # Print the JSON body to stdout for caller to capture
+        echo "$response_body"
     else
         log_message "ERROR" "Vault API call to '${endpoint}' failed with HTTP code ${response_code}. Response: ${response_body:-"No response body"}"
         return 1 # Indicate failure
@@ -92,28 +113,31 @@ vault_api_call() {
 
 log_message "INFO" "Starting Vault Agent Script..."
 
-# Check if 'jq' command is available for JSON parsing
+# 1. Load configuration
+load_config
+
+# 2. Check if 'jq' command is available for JSON parsing
 if ! command -v jq &> /dev/null; then
     log_message "CRITICAL" "'jq' command not found. Please install jq to parse JSON. Exiting."
     exit 1
 fi
 
-# Check if 'curl' command is available for API calls
+# 3. Check if 'curl' command is available for API calls
 if ! command -v curl &> /dev/null; then
     log_message "CRITICAL" "'curl' command not found. Please install curl. Exiting."
     exit 1
 fi
 
-# Check if VAULT_TOKEN environment variable is set
+# 4. Check if VAULT_TOKEN is set (from env or config file)
 if [[ -z "${VAULT_TOKEN:-}" ]]; then
-    log_message "CRITICAL" "VAULT_TOKEN environment variable is not set. Please set it before running the script. Exiting."
+    log_message "CRITICAL" "VAULT_TOKEN is not set. Please set it as an environment variable or in the configuration file (${CONFIG_FILE}). Exiting."
     exit 1
 fi
 
 # --- Main Logic ---
 
 # 1. Lookup self token details
-log_message "INFO" "Looking up self token details..."
+log_message "INFO" "Looking up self token details for Vault address: ${VAULT_ADDR}..."
 LOOKUP_RESPONSE=$(vault_api_call "GET" "auth/token/lookup-self")
 
 # Check if the API call was successful
@@ -126,7 +150,7 @@ fi
 TOKEN_TTL=$(echo "${LOOKUP_RESPONSE}" | jq -r '.data.ttl')
 TOKEN_CREATION_TTL=$(echo "${LOOKUP_RESPONSE}" | jq -r '.data.creation_ttl')
 
-# Validate that TTL values were successfully parsed
+# Validate that TTL values were successfully parsed and are numeric
 if [[ -z "${TOKEN_TTL}" || -z "${TOKEN_CREATION_TTL}" || ! "$TOKEN_TTL" =~ ^[0-9]+$ || ! "$TOKEN_CREATION_TTL" =~ ^[0-9]+$ ]]; then
     log_message "CRITICAL" "Could not parse valid 'ttl' or 'creation_ttl' from token lookup response using jq. Raw response: ${LOOKUP_RESPONSE}. Exiting."
     exit 1
@@ -149,9 +173,9 @@ if [[ "${TOKEN_TTL}" -lt "${REQUIRED_TTL}" ]]; then
         exit 1
     fi
 
-    # Optionally parse new TTL after renewal (not strictly necessary as we assume it's renewed)
+    # Optionally parse new TTL after renewal
     NEW_TOKEN_TTL=$(echo "${RENEW_RESPONSE}" | jq -r '.data.ttl')
-    if [[ -n "${NEW_TOKEN_TTL}" ]]; then
+    if [[ -n "${NEW_TOKEN_TTL}" && "$NEW_TOKEN_TTL" =~ ^[0-9]+$ ]]; then
         log_message "INFO" "Token renewed successfully. New TTL: ${NEW_TOKEN_TTL} seconds."
     else
         log_message "INFO" "Token renewed successfully, but could not parse new TTL from response."
